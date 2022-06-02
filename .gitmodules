@@ -1,4 +1,3 @@
-[submodule "waveglow"]
-	path = waveglow
-	url = https://github.com/NVIDIA/waveglow
-	branch = master
+[submodule "nvidia_waveglow"]
+	path = nvidia_waveglow
+	url = https://bitbucket.org/tdisolutions/nvidia_waveglow

@@ -1,62 +1,18 @@
-import os
-import time
 import argparse
 import math
-from numpy import finfo
+import os
+import time
 
 import torch
-from distributed import apply_gradient_allreduce
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 
-from model import Tacotron2
-from data_utils import TextMelLoader, TextMelCollate
-from loss_function import Tacotron2Loss
-from logger import Tacotron2Logger
 from hparams import create_hparams
-
-
-def reduce_tensor(tensor, n_gpus):
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.reduce_op.SUM)
-    rt /= n_gpus
-    return rt
-
-
-def init_distributed(hparams, n_gpus, rank, group_name):
-    assert torch.cuda.is_available(), "Distributed mode requires CUDA."
-    print("Initializing Distributed")
-
-    # Set cuda device so everything is done on the right GPU.
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-
-    # Initialize distributed communication
-    dist.init_process_group(
-        backend=hparams.dist_backend, init_method=hparams.dist_url,
-        world_size=n_gpus, rank=rank, group_name=group_name)
-
-    print("Done initializing distributed")
-
-
-def prepare_dataloaders(hparams):
-    # Get data, data loaders and collate function ready
-    trainset = TextMelLoader(hparams.training_files, hparams)
-    valset = TextMelLoader(hparams.validation_files, hparams)
-    collate_fn = TextMelCollate(hparams.n_frames_per_step)
-
-    if hparams.distributed_run:
-        train_sampler = DistributedSampler(trainset)
-        shuffle = False
-    else:
-        train_sampler = None
-        shuffle = True
-
-    train_loader = DataLoader(trainset, num_workers=1, shuffle=shuffle,
-                              sampler=train_sampler,
-                              batch_size=hparams.batch_size, pin_memory=False,
-                              drop_last=True, collate_fn=collate_fn)
-    return train_loader, valset, collate_fn
+from libs.data.dataloader import prepare_dataloaders
+from libs.logger import Tacotron2Logger
+from libs.model.checkpoint import load_checkpoint, save_checkpoint
+from libs.model.loader import load_model
+from libs.model.loss_function import Tacotron2Loss
+from libs.multiproc.distributed import apply_gradient_allreduce, reduce_tensor, init_distributed
 
 
 def prepare_directories_and_logger(output_directory, log_directory, rank):
@@ -68,17 +24,6 @@ def prepare_directories_and_logger(output_directory, log_directory, rank):
     else:
         logger = None
     return logger
-
-
-def load_model(hparams):
-    model = Tacotron2(hparams).cuda()
-    if hparams.fp16_run:
-        model.decoder.attention_layer.score_mask_value = finfo('float16').min
-
-    if hparams.distributed_run:
-        model = apply_gradient_allreduce(model)
-
-    return model
 
 
 def warm_start_model(checkpoint_path, model, ignore_layers):
@@ -96,37 +41,18 @@ def warm_start_model(checkpoint_path, model, ignore_layers):
     return model
 
 
-def load_checkpoint(checkpoint_path, model, optimizer):
-    assert os.path.isfile(checkpoint_path)
-    print("Loading checkpoint '{}'".format(checkpoint_path))
-    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(checkpoint_dict['state_dict'])
-    optimizer.load_state_dict(checkpoint_dict['optimizer'])
-    learning_rate = checkpoint_dict['learning_rate']
-    iteration = checkpoint_dict['iteration']
-    print("Loaded checkpoint '{}' from iteration {}" .format(
-        checkpoint_path, iteration))
-    return model, optimizer, learning_rate, iteration
-
-
-def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
-    print("Saving model and optimizer state at iteration {} to {}".format(
-        iteration, filepath))
-    torch.save({'iteration': iteration,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'learning_rate': learning_rate}, filepath)
-
-
-def validate(model, criterion, valset, iteration, batch_size, n_gpus,
+def validate(model, criterion, val_dataset, iteration, batch_size, n_gpus,
              collate_fn, logger, distributed_run, rank):
     """Handles all the validation scoring and printing"""
     model.eval()
     with torch.no_grad():
-        val_sampler = DistributedSampler(valset) if distributed_run else None
-        val_loader = DataLoader(valset, sampler=val_sampler, num_workers=1,
-                                shuffle=False, batch_size=batch_size,
-                                pin_memory=False, collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset,
+                                sampler=None,
+                                num_workers=1,
+                                shuffle=False,
+                                batch_size=batch_size,
+                                pin_memory=False,
+                                collate_fn=collate_fn)
 
         val_loss = 0.0
         for i, batch in enumerate(val_loader):
@@ -183,7 +109,7 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
     logger = prepare_directories_and_logger(
         output_directory, log_directory, rank)
 
-    train_loader, valset, collate_fn = prepare_dataloaders(hparams)
+    train_loader, val_dataset, collate_fn = prepare_dataloaders(hparams)
 
     # Load checkpoint if one exists
     iteration = 0
@@ -237,20 +163,16 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
 
             if not is_overflow and rank == 0:
                 duration = time.perf_counter() - start
-                print("Train loss {} {:.6f} Grad Norm {:.6f} {:.2f}s/it".format(
-                    iteration, reduced_loss, grad_norm, duration))
-                logger.log_training(
-                    reduced_loss, grad_norm, learning_rate, duration, iteration)
+                print(f"Train loss {iteration} {reduced_loss:.6f} Grad Norm {grad_norm:.6f} {duration:.2f}s/it")
+                if iteration % hparams.iters_per_log == 0:
+                    logger.log_training(reduced_loss, grad_norm, learning_rate, duration, iteration)
 
             if not is_overflow and (iteration % hparams.iters_per_checkpoint == 0):
-                validate(model, criterion, valset, iteration,
-                         hparams.batch_size, n_gpus, collate_fn, logger,
-                         hparams.distributed_run, rank)
+                validate(model, criterion, val_dataset, iteration, hparams.batch_size, n_gpus,
+                         collate_fn, logger, hparams.distributed_run, rank)
                 if rank == 0:
-                    checkpoint_path = os.path.join(
-                        output_directory, "checkpoint_{}".format(iteration))
-                    save_checkpoint(model, optimizer, learning_rate, iteration,
-                                    checkpoint_path)
+                    checkpoint_path = os.path.join(output_directory, f"checkpoint_{iteration}")
+                    save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path)
 
             iteration += 1
 

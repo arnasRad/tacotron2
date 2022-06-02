@@ -1,0 +1,3 @@
+[submodule "nvidia_tacotron_2"]
+	path = nvidia_tacotron_2
+	url = https://bitbucket.org/tdisolutions/nvidia_tacotron_2
